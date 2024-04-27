@@ -7,6 +7,7 @@ At its core it uses Hugging Face's PyTorch implementation
 (https://github.com/huggingface/pytorch-pretrained-BERT),
 so thanks to them!
 """
+import os
 from typing import Dict, List, Union
 import logging
 
@@ -34,11 +35,12 @@ class PretrainedBertModel:
     def load(cls, model_name: str, cache_model: bool = True) -> BertModel:
         if model_name in cls._cache:
             return PretrainedBertModel._cache[model_name]
-
-        model = BertModel.from_pretrained(model_name)
+        logger.info("[*] DEBUG - input model name: {}".format(model_name))
+        model = BertModel.from_pretrained(model_name) #model_name => path to the tar.gz
         if cache_model:
             cls._cache[model_name] = model
-
+        print("DEBUG MODEL READ, model config: ", model)
+        logger.info("DEBUG: Read model => , model config: {}".format(model.config))
         return model
 
 
@@ -269,7 +271,10 @@ class PretrainedBertEmbedder(BertEmbedder):
     """
     def __init__(self, pretrained_model: str, requires_grad: str = 'none', top_layer_only: bool = False,
                  scalar_mix_parameters: List[float] = None) -> None:
+        
+        logger.info("[*] LOADING MODEL FROM {}".format(pretrained_model))
         model = PretrainedBertModel.load(pretrained_model)
+        logger.info("[*] Model loaded successfully.")
 
         if requires_grad in ['none', 'all']:
             for param in model.parameters():

@@ -21,9 +21,23 @@ from allennlp.data import instance as adi  # pylint: disable=unused-import
 
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
+USE_HF_SPECIAL_TOKENS = os.environ.get("USE_HF_SPECIAL_TOKENS", False)
+
+# For Huggingface models you need to used HF tokens.
+if USE_HF_SPECIAL_TOKENS:
+    logger.info("=============Using Hugginface tokens [PAD] and [UNK]=============")
+    DEFAULT_PADDING_TOKEN = "[PAD]"
+    DEFAULT_OOV_TOKEN = "[UNK]"
+
+# Use Allen Nlp tokens by default.
+else:
+    logger.info("=============Using AllenNlp tokens '@@PADDING@@' and '@@UNKNOWN@@'=============")
+    DEFAULT_PADDING_TOKEN = "@@PADDING@@"
+    DEFAULT_OOV_TOKEN = "@@UNKNOWN@@"
+
+
 DEFAULT_NON_PADDED_NAMESPACES = ("*tags", "*labels")
-DEFAULT_PADDING_TOKEN = "@@PADDING@@"
-DEFAULT_OOV_TOKEN = "@@UNKNOWN@@"
+
 NAMESPACE_PADDING_FILE = 'non_padded_namespaces.txt'
 
 
@@ -339,6 +353,7 @@ class Vocabulary(Registrable):
         vocab = cls(non_padded_namespaces=non_padded_namespaces)
 
         # Check every file in the directory.
+
         for namespace_filename in os.listdir(directory):
             if namespace_filename == NAMESPACE_PADDING_FILE:
                 continue
@@ -350,6 +365,7 @@ class Vocabulary(Registrable):
             else:
                 is_padded = True
             filename = os.path.join(directory, namespace_filename)
+            logger.info("Setting vocab from file {}".format(filename))
             vocab.set_from_file(filename, is_padded, namespace=namespace)
 
         return vocab
@@ -385,6 +401,9 @@ class Vocabulary(Registrable):
         namespace : ``str``, optional (default="tokens")
             What namespace should we overwrite with this vocab file?
         """
+
+        print("filename", filename)
+
         if is_padded:
             self._token_to_index[namespace] = {self._padding_token: 0}
             self._index_to_token[namespace] = {0: self._padding_token}
@@ -404,6 +423,8 @@ class Vocabulary(Registrable):
                 self._token_to_index[namespace][token] = index
                 self._index_to_token[namespace][index] = token
         if is_padded:
+            print(self._oov_token)
+            print(namespace)
             assert self._oov_token in self._token_to_index[namespace], "OOV token not found!"
 
     @classmethod
@@ -491,7 +512,9 @@ class Vocabulary(Registrable):
                 logger.info("Loading Vocab from files instead of dataset.")
 
         if vocabulary_directory:
+            logger.info("Loading vocabulary from directory {}".format(vocabulary_directory))
             vocab = cls.from_files(vocabulary_directory)
+            logger.info("Loading completed. Read vocab from {}".format(vocabulary_directory))
             if not extend:
                 params.assert_empty("Vocabulary - from files")
                 return vocab
