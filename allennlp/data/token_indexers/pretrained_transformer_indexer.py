@@ -50,6 +50,7 @@ class PretrainedTransformerIndexer(TokenIndexer[int]):
             logger.warning("Your pretrained model appears to be uncased, "
                            "but your indexer is not lowercasing tokens.")
         self._model_name = model_name
+        print("Initializing PretrainedTransformerIndexer from {}".format(model_name))
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, do_lower_case=do_lowercase)
         self._namespace = namespace
         self._added_to_vocabulary = False
