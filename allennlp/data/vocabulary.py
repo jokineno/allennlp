@@ -31,6 +31,7 @@ if USE_HF_SPECIAL_TOKENS:
 
 # Use Allen Nlp tokens by default.
 else:
+    # this is default setting
     logger.info("=============Using AllenNlp tokens '@@PADDING@@' and '@@UNKNOWN@@'=============")
     DEFAULT_PADDING_TOKEN = "@@PADDING@@"
     DEFAULT_OOV_TOKEN = "@@UNKNOWN@@"

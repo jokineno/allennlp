@@ -2,7 +2,8 @@ from typing import Dict, List
 import logging
 
 from overrides import overrides
-from pytorch_transformers.tokenization_auto import AutoTokenizer
+#from pytorch_transformers.tokenization_auto import AutoTokenizer
+from transformers import AutoTokenizer
 import torch
 
 from allennlp.common.util import pad_sequence_to_length

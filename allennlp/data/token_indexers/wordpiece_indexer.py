@@ -4,8 +4,8 @@ import logging
 
 from overrides import overrides
 import torch
-from pytorch_pretrained_bert.tokenization import BertTokenizer
-
+#from pytorch_pretrained_bert.tokenization import BertTokenizer
+from transformers import BertTokenizer
 from allennlp.common.util import pad_sequence_to_length
 from allennlp.data.vocabulary import Vocabulary
 from allennlp.data.tokenizers.token import Token
