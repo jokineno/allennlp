@@ -48,19 +48,23 @@ class TrainerPieces(NamedTuple):
 
         logger.info("From dataset instances, %s will be considered for vocabulary creation.",
                     ", ".join(datasets_for_vocab_creation))
+        
 
-        if recover and os.path.exists(os.path.join(serialization_dir, "vocabulary")):
-            vocab = Vocabulary.from_files(os.path.join(serialization_dir, "vocabulary"))
-            params.pop("vocabulary", {})
-        else:
-            vocab = Vocabulary.from_params(
-                    params.pop("vocabulary", {}),
-                    # Using a generator comprehension here is important
-                    # because, being lazy, it allows us to not iterate over the
-                    # dataset when directory_path is specified.
-                    (instance for key, dataset in all_datasets.items()
-                     if key in datasets_for_vocab_creation for instance in dataset)
-            )
+        print("Initializing Vocabulary from Params and pretrained transformer")
+        vocab = Vocabulary.from_params(params.pop("vocabulary", {}))
+        # if True: 
+        #     pass
+        # elif recover and os.path.exists(os.path.join(serialization_dir, "vocabulary")):
+        #     vocab = Vocabulary.from_files(os.path.join(serialization_dir, "vocabulary"))
+        # else:
+        #     vocab = Vocabulary.from_params(
+        #             params.pop("vocabulary", {}),
+        #             # Using a generator comprehension here is important
+        #             # because, being lazy, it allows us to not iterate over the
+        #             # dataset when directory_path is specified.
+        #             (instance for key, dataset in all_datasets.items()
+        #              if key in datasets_for_vocab_creation for instance in dataset)
+        #     )
 
         model = Model.from_params(vocab=vocab, params=params.pop('model'))
 
@@ -70,7 +74,6 @@ class TrainerPieces(NamedTuple):
 
         # Initializing the model can have side effect of expanding the vocabulary
         vocab.save_to_files(os.path.join(serialization_dir, "vocabulary"))
-
         iterator = DataIterator.from_params(params.pop("iterator"))
         iterator.index_with(model.vocab)
         validation_iterator_params = params.pop("validation_iterator", None)

@@ -17,6 +17,7 @@ from allennlp.common.checks import ConfigurationError
 from allennlp.common.tqdm import Tqdm
 from allennlp.common.file_utils import cached_path
 from allennlp.data import instance as adi  # pylint: disable=unused-import
+from transformers import PreTrainedTokenizer, AutoTokenizer
 
 
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
@@ -428,6 +429,46 @@ class Vocabulary(Registrable):
             print(namespace)
             assert self._oov_token in self._token_to_index[namespace], "OOV token not found!"
 
+    
+    @classmethod
+    def from_pretrained_transformer(
+        cls, model_name: str, namespace: str = "tokens", oov_token=DEFAULT_OOV_TOKEN
+    ) -> "Vocabulary":
+        """
+        Initialize a vocabulary from the vocabulary of a pretrained transformer model.
+        If `oov_token` is not given, we will try to infer it from the transformer tokenizer.
+        """
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        if oov_token is None:
+            if hasattr(tokenizer, "_unk_token"):
+                oov_token = tokenizer._unk_token
+            elif hasattr(tokenizer, "special_tokens_map"):
+                oov_token = tokenizer.special_tokens_map.get("unk_token")
+
+        print("Using oov_token={}".format(oov_token))
+        vocab = cls(non_padded_namespaces=[namespace])
+        vocab.add_transformer_vocab(tokenizer, namespace)
+        return vocab  
+    
+    def add_transformer_vocab(
+        self, tokenizer: PreTrainedTokenizer, namespace: str = "tokens"
+    ) -> None:
+        """
+        Copies tokens from a transformer tokenizer's vocab into the given namespace.
+        """
+        try:
+            vocab_items = tokenizer.get_vocab().items()
+        except NotImplementedError:
+            vocab_items = (
+                (tokenizer.convert_ids_to_tokens(idx), idx) for idx in range(tokenizer.vocab_size)
+            )
+
+        for word, idx in vocab_items:
+            self._token_to_index[namespace][word] = idx
+            self._index_to_token[namespace][idx] = word
+
+        self._non_padded_namespaces.add(namespace)
+      
     @classmethod
     def from_instances(cls,
                        instances: Iterable['adi.Instance'],
@@ -493,6 +534,10 @@ class Vocabulary(Registrable):
         # such, we just add the logic for instantiating a registered subclass here,
         # so that most users can continue doing what they were doing.
         vocab_type = params.pop("type", None)
+        if vocab_type == "from_pretrained_transformer":
+            model_name = params.pop("model_name")
+            print("Initializing vocab from pretrained transformer {}".format(model_name))
+            return cls.from_pretrained_transformer(model_name)
         if vocab_type is not None:
             return cls.by_name(vocab_type).from_params(params=params, instances=instances)
 
@@ -747,6 +792,6 @@ class Vocabulary(Registrable):
             logger.info("Vocabulary statistics cannot be printed since " \
                         "dataset instances were not used for its construction.")
 
-
 # the tricky part is that `Vocabulary` is both the base class and the default implementation
 Vocabulary.register("default")(Vocabulary)
+Vocabulary.register("from_pretrained_transformer")(Vocabulary)
