@@ -50,21 +50,22 @@ class TrainerPieces(NamedTuple):
                     ", ".join(datasets_for_vocab_creation))
         
 
-        print("Initializing Vocabulary from Params and pretrained transformer")
-        vocab = Vocabulary.from_params(params.pop("vocabulary", {}))
-        # if True: 
-        #     pass
-        # elif recover and os.path.exists(os.path.join(serialization_dir, "vocabulary")):
-        #     vocab = Vocabulary.from_files(os.path.join(serialization_dir, "vocabulary"))
-        # else:
-        #     vocab = Vocabulary.from_params(
-        #             params.pop("vocabulary", {}),
-        #             # Using a generator comprehension here is important
-        #             # because, being lazy, it allows us to not iterate over the
-        #             # dataset when directory_path is specified.
-        #             (instance for key, dataset in all_datasets.items()
-        #              if key in datasets_for_vocab_creation for instance in dataset)
-        #     )
+        #print("Initializing Vocabulary from Params and pretrained transformer")
+        #vocab = Vocabulary.from_params(params.pop("vocabulary", {}))
+        #print(vocab)
+        if recover and os.path.exists(os.path.join(serialization_dir, "vocabulary")):
+            vocab = Vocabulary.from_files(os.path.join(serialization_dir, "vocabulary"))
+        else:
+            vocab = Vocabulary.from_params(
+                    params.pop("vocabulary", {}),
+                    # Using a generator comprehension here is important
+                    # because, being lazy, it allows us to not iterate over the
+                    # dataset when directory_path is specified.
+                    (instance for key, dataset in all_datasets.items()
+                     if key in datasets_for_vocab_creation for instance in dataset)
+            )
+
+        print(vocab)
 
         model = Model.from_params(vocab=vocab, params=params.pop('model'))
 
