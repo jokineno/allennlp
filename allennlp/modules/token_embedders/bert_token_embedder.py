@@ -14,8 +14,8 @@ import logging
 import torch
 import torch.nn.functional as F
 
-from pytorch_pretrained_bert.modeling import BertModel
-
+#from pytorch_pretrained_bert.modeling import BertModel
+from transformers import BertModel
 from allennlp.modules.scalar_mix import ScalarMix
 from allennlp.modules.token_embedders.token_embedder import TokenEmbedder
 from allennlp.nn import util
