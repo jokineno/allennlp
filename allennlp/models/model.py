@@ -264,7 +264,8 @@ class Model(torch.nn.Module, Registrable):
         remove_pretrained_embedding_params(model_params)
         print('model_params:',model_params.params)
         model = Model.from_params(vocab=vocab, params=model_params)
-
+        initial_weights = {name: param.clone().detach() for name, param in model.named_parameters()}
+        print("model architecture", model)
         # If vocab+embedding extension was done, the model initialized from from_params
         # and one defined by state dict in weights_file might not have same embedding shapes.
         # Eg. when model embedder module was transferred along with vocab extension, the
@@ -274,16 +275,25 @@ class Model(torch.nn.Module, Registrable):
         model.extend_embedder_vocab()
         print("[DEBUG] weights file: ", weights_file)
         model_state = torch.load(weights_file, map_location=util.device_mapping(cuda_device))
-        print("[DEBUG] model_state keys first 10", list(model_state.keys())[:10])
-        model.load_state_dict(model_state, strict=False) # TODO if strict is True => the expects certain layer names. If False works at least with Finbert.
-        print("[DEBUG] model loaded")
+        #print("[DEBUG] model_state keys first 10", list(model_state.keys())[:10])
+        model.load_state_dict(model_state, strict=True) # TODO if strict is True => the expects certain layer names. If False works at least with Finbert.
+        print("[DEBUG] Updated existing model with fine-tuned weights...")
         # Force model to cpu or gpu, as appropriate, to make sure that the embeddings are
         # in sync with the weights
+        print("[DEBUG] Comparing weights of pretrained model and fine-tuned model. they should not match from most parts")
+        for name, param in model.named_parameters():
+            initial_param = initial_weights[name]
+            # Check if the weights are different in any element
+            if not torch.equal(initial_param, param):
+                print(f"Updated weights in layer: {name}")
+            else:
+                print(f"No change in weights for layer: {name}")
+
         if cuda_device >= 0:
             model.cuda(cuda_device)
         else:
             model.cpu()
-
+       
         return model
 
     @classmethod
