@@ -246,8 +246,8 @@ class Model(torch.nn.Module, Registrable):
         Instantiates an already-trained model, based on the experiment
         configuration and some optional overrides.
         """
+        print("[DEBUG] init weights_file", weights_file, "default_weights", _DEFAULT_WEIGHTS)
         weights_file = weights_file or os.path.join(serialization_dir, _DEFAULT_WEIGHTS)
-
         # Load vocabulary from file
         vocab_dir = os.path.join(serialization_dir, 'vocabulary')
         # If the config specifies a vocabulary subclass, we need to use it.
@@ -262,8 +262,10 @@ class Model(torch.nn.Module, Registrable):
         # stored in our weights.  We don't need any pretrained weight file anymore, and we don't
         # want the code to look for it, so we remove it from the parameters here.
         remove_pretrained_embedding_params(model_params)
+        print('model_params:',model_params.params)
         model = Model.from_params(vocab=vocab, params=model_params)
-
+        initial_weights = {name: param.clone().detach() for name, param in model.named_parameters()}
+        print("model architecture", model)
         # If vocab+embedding extension was done, the model initialized from from_params
         # and one defined by state dict in weights_file might not have same embedding shapes.
         # Eg. when model embedder module was transferred along with vocab extension, the
@@ -271,17 +273,27 @@ class Model(torch.nn.Module, Registrable):
         # So calling model embedding extension is required before load_state_dict.
         # If vocab and model embeddings are in sync, following would be just a no-op.
         model.extend_embedder_vocab()
-
+        print("[DEBUG] weights file: ", weights_file)
         model_state = torch.load(weights_file, map_location=util.device_mapping(cuda_device))
-        model.load_state_dict(model_state)
-
+        #print("[DEBUG] model_state keys first 10", list(model_state.keys())[:10])
+        model.load_state_dict(model_state, strict=True) # TODO if strict is True => the expects certain layer names. If False works at least with Finbert.
+        print("[DEBUG] Updated existing model with fine-tuned weights...")
         # Force model to cpu or gpu, as appropriate, to make sure that the embeddings are
         # in sync with the weights
+        print("[DEBUG] Comparing weights of pretrained model and fine-tuned model. they should not match from most parts")
+        for name, param in model.named_parameters():
+            initial_param = initial_weights[name]
+            # Check if the weights are different in any element
+            if not torch.equal(initial_param, param):
+                print(f"Updated weights in layer: {name}")
+            else:
+                print(f"No change in weights for layer: {name}")
+
         if cuda_device >= 0:
             model.cuda(cuda_device)
         else:
             model.cpu()
-
+       
         return model
 
     @classmethod
@@ -319,11 +331,12 @@ class Model(torch.nn.Module, Registrable):
         """
 
         # Peak at the class of the model.
-        model_type = config["model"]["type"]
+        model_type = config["model"] if isinstance(config["model"], str) else config["model"]["type"]
 
         # Load using an overridable _load method.
         # This allows subclasses of Model to override _load.
         # pylint: disable=protected-access
+        print("[DEBUG] Loading model, model_type, config, weights_file", model_type, config, weights_file)
         return cls.by_name(model_type)._load(config, serialization_dir, weights_file, cuda_device)
 
     def extend_embedder_vocab(self, embedding_sources_mapping: Dict[str, str] = None) -> None:
@@ -331,7 +344,7 @@ class Model(torch.nn.Module, Registrable):
         Iterates through all embedding modules in the model and assures it can embed
         with the extended vocab. This is required in fine-tuning or transfer learning
         scenarios where model was trained with original vocabulary but during
-        fine-tuning/tranfer-learning, it will have it work with extended vocabulary
+        fine-tuning/transfer-learning, it will have it work with extended vocabulary
         (original + new-data vocabulary).
 
         Parameters
@@ -354,9 +367,10 @@ class Model(torch.nn.Module, Registrable):
                                     model_path=model_path)
 
 def remove_pretrained_embedding_params(params: Params):
-    keys = params.keys()
-    if 'pretrained_file' in keys:
-        del params['pretrained_file']
-    for value in params.values():
-        if isinstance(value, Params):
-            remove_pretrained_embedding_params(value)
+    if isinstance(params, Params):  # The model could possible be a string, for example.
+        keys = params.keys()
+        if 'pretrained_file' in keys:
+            del params['pretrained_file']
+        for value in params.values():
+            if isinstance(value, Params):
+                remove_pretrained_embedding_params(value)

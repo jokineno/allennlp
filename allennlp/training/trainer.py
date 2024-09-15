@@ -3,10 +3,9 @@ import logging
 import math
 import os
 import time
-import re
 import datetime
 import traceback
-from typing import Dict, Optional, List, Tuple, Union, Iterable, Any, NamedTuple
+from typing import Dict, Optional, List, Tuple, Union, Iterable, Any
 
 import torch
 import torch.optim.lr_scheduler
@@ -14,11 +13,10 @@ import torch.optim.lr_scheduler
 from allennlp.common import Params
 from allennlp.common.checks import ConfigurationError, parse_cuda_device
 from allennlp.common.util import (dump_metrics, gpu_memory_mb, peak_memory_mb,
-                                  get_frozen_and_tunable_parameter_names, lazy_groups_of)
+                                  lazy_groups_of)
 from allennlp.common.tqdm import Tqdm
 from allennlp.data.instance import Instance
 from allennlp.data.iterators.data_iterator import DataIterator, TensorDict
-from allennlp.data.vocabulary import Vocabulary
 from allennlp.models.model import Model
 from allennlp.nn import util as nn_util
 from allennlp.training.checkpointer import Checkpointer
@@ -43,6 +41,7 @@ class Trainer(TrainerBase):
                  train_dataset: Iterable[Instance],
                  validation_dataset: Optional[Iterable[Instance]] = None,
                  patience: Optional[int] = None,
+                 min_delta: float = 0.0,
                  validation_metric: str = "-loss",
                  validation_iterator: DataIterator = None,
                  shuffle: bool = True,
@@ -62,7 +61,10 @@ class Trainer(TrainerBase):
                  should_log_parameter_statistics: bool = True,
                  should_log_learning_rate: bool = False,
                  log_batch_size_period: Optional[int] = None,
-                 moving_average: Optional[MovingAverage] = None) -> None:
+                 moving_average: Optional[MovingAverage] = None,
+                 fp16: bool = False,
+                 gradient_accumulation_batch_size: int = None,
+                 num_steps_reset_metrics: int = None) -> None:
         """
         A trainer for doing supervised learning. It just takes a labeled dataset
         and a ``DataIterator``, and uses the supplied ``Optimizer`` to learn the weights
@@ -92,6 +94,8 @@ class Trainer(TrainerBase):
             Number of epochs to be patient before early stopping: the training is stopped
             after ``patience`` epochs with no improvement. If given, it must be ``> 0``.
             If None, early stopping is disabled.
+        min_delta: float, optional, (default=0.0).
+            Min change in metric to be considered better.
         validation_metric : str, optional (default="loss")
             Validation metric to measure for whether to stop training using patience
             and whether to serialize an ``is_best`` model each epoch. The metric name
@@ -173,6 +177,14 @@ class Trainer(TrainerBase):
             parameters. Be careful that when saving the checkpoint, we will save the moving averages of
             parameters. This is necessary because we want the saved model to perform as well as the validated
             model if we load it later. But this may cause problems if you restart the training from checkpoint.
+        fp16: ``bool``, (default = False)
+            If True, then run with half precison.  This option requires apex
+            (https://www.github.com/nvidia/apex) to be installed, and for ``model.half()`` to be
+            called before constructing the Trainer. (If you use `Trainer.from_params` this will be
+            handled for you.)
+        gradient_accumulation_batch_size: ``int``, (default = None)
+            if provided, then accumulate gradients until the effective batch
+            size is at least this value.
         """
         super().__init__(serialization_dir, cuda_device)
 
@@ -186,6 +198,7 @@ class Trainer(TrainerBase):
         self.optimizer = optimizer
         self.train_data = train_dataset
         self._validation_data = validation_dataset
+        self.fp16 = fp16
 
         if patience is None:  # no early stopping
             if validation_dataset:
@@ -196,7 +209,7 @@ class Trainer(TrainerBase):
                                      'or None (if you want to disable early stopping)'.format(patience))
 
         # For tracking is_best_so_far and should_stop_early
-        self._metric_tracker = MetricTracker(patience, validation_metric)
+        self._metric_tracker = MetricTracker(patience, validation_metric, min_delta=min_delta)
         # Get rid of + or -
         self._validation_metric = validation_metric[1:]
 
@@ -245,6 +258,9 @@ class Trainer(TrainerBase):
         # Enable activation logging.
         if histogram_interval is not None:
             self._tensorboard.enable_activation_logging(self.model)
+
+        self.gradient_accumulation_batch_size = gradient_accumulation_batch_size
+        self.num_steps_reset_metrics = num_steps_reset_metrics
 
     def rescale_gradients(self) -> Optional[float]:
         return training_util.rescale_gradients(self.model, self._grad_norm)
@@ -312,22 +328,60 @@ class Trainer(TrainerBase):
         train_generator_tqdm = Tqdm.tqdm(train_generator,
                                          total=num_training_batches)
         cumulative_batch_size = 0
+
+        accumulated_batches = []
+        accumulated_batch_sizes = []
+
         for batch_group in train_generator_tqdm:
+            accumulated_batches.append(batch_group)
+            cur_batch = sum([training_util.get_batch_size(batch) for batch in batch_group])
+            accumulated_batch_sizes.append(cur_batch)
+            effective_batch_size = sum(accumulated_batch_sizes)
+
+            # check to see if this is a gradient update step
+            if self.gradient_accumulation_batch_size is None:
+                do_update_grads = True
+            else:
+                if effective_batch_size >= self.gradient_accumulation_batch_size:
+                    do_update_grads = True
+                else:
+                    do_update_grads = False
+
+            if not do_update_grads:
+                # get another batch from the generator
+                continue
+
+            # else run the forward/backward for each batch
             batches_this_epoch += 1
             self._batch_num_total += 1
             batch_num_total = self._batch_num_total
 
+            if hasattr(self.model, 'step_batch'):
+                self.model.step_batch(batch_num_total)
+
             self.optimizer.zero_grad()
 
-            loss = self.batch_loss(batch_group, for_training=True)
+            # process all the accumulated gradients
+            for this_batch, this_batch_size in zip(
+                    accumulated_batches, accumulated_batch_sizes
+            ):
+                loss = self.batch_loss(this_batch, for_training=True)
+                loss = loss * (this_batch_size / float(effective_batch_size))
 
-            if torch.isnan(loss):
-                raise ValueError("nan loss encountered")
+                if torch.isnan(loss):
+                    raise ValueError("nan loss encountered")
 
-            loss.backward()
+                if self.fp16:
+                    self.optimizer.backward(loss)
+                else:
+                    loss.backward()
 
-            train_loss += loss.item()
+                train_loss += loss.item()
 
+            accumulated_batches = []
+            accumulated_batch_sizes = []
+
+            # now update the gradients
             batch_grad_norm = self.rescale_gradients()
 
             # This does nothing if batch_num_total is None or you are using a
@@ -358,7 +412,12 @@ class Trainer(TrainerBase):
                 self._moving_average.apply(batch_num_total)
 
             # Update the description with the latest metrics
-            metrics = training_util.get_metrics(self.model, train_loss, batches_this_epoch)
+            if self.num_steps_reset_metrics is not None and batch_num_total % self.num_steps_reset_metrics == 0:
+                reset_metrics = True
+            else:
+                reset_metrics = False
+
+            metrics = training_util.get_metrics(self.model, train_loss, batches_this_epoch, reset=reset_metrics)
             description = training_util.description_from_metrics(metrics)
 
             train_generator_tqdm.set_description(description, refresh=False)
@@ -551,6 +610,9 @@ class Trainer(TrainerBase):
 
             epochs_trained += 1
 
+        # make sure pending events are flushed to disk and files are closed properly
+        self._tensorboard.close()
+
         # Load the best model state before returning
         best_model_state = self._checkpointer.best_model_state()
         if best_model_state:
@@ -665,6 +727,7 @@ class Trainer(TrainerBase):
                     validation_iterator: DataIterator = None) -> 'Trainer':
         # pylint: disable=arguments-differ
         patience = params.pop_int("patience", None)
+        min_delta = params.pop_float("min_delta", 0.0)
         validation_metric = params.pop("validation_metric", "-loss")
         shuffle = params.pop_bool("shuffle", True)
         num_epochs = params.pop_int("num_epochs", 20)
@@ -673,18 +736,39 @@ class Trainer(TrainerBase):
         grad_clipping = params.pop_float("grad_clipping", None)
         lr_scheduler_params = params.pop("learning_rate_scheduler", None)
         momentum_scheduler_params = params.pop("momentum_scheduler", None)
+        fp16 = params.pop_bool("fp16", False)
+        gradient_accumulation_batch_size = params.pop_int("gradient_accumulation_batch_size", None)
+        num_steps_reset_metrics = params.pop_int("num_steps_reset_metrics", None)
 
         if isinstance(cuda_device, list):
             model_device = cuda_device[0]
         else:
             model_device = cuda_device
+        if fp16:
+            model.half()
         if model_device >= 0:
             # Moving model to GPU here so that the optimizer state gets constructed on
             # the right device.
             model = model.cuda(model_device)
 
         parameters = [[n, p] for n, p in model.named_parameters() if p.requires_grad]
+
+        # If fp16, need to wrap the optimizer
+        if fp16:
+            try:
+                from apex.optimizers import FusedAdam
+            except ImportError:
+                raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
+
         optimizer = Optimizer.from_params(parameters, params.pop("optimizer"))
+        if fp16:
+            # The FP16_Optimizer we use depends on whether the optimizer is FusedAdam or a regular pytorch optimizer
+            if isinstance(optimizer, FusedAdam):
+                from apex.optimizers import FP16_Optimizer
+            else:
+                from apex.fp16_utils import FP16_Optimizer
+            optimizer = FP16_Optimizer(optimizer, dynamic_loss_scale=True)
+
         if "moving_average" in params:
             moving_average = MovingAverage.from_params(params.pop("moving_average"), parameters=parameters)
         else:
@@ -726,6 +810,7 @@ class Trainer(TrainerBase):
         return cls(model, optimizer, iterator,
                    train_data, validation_data,
                    patience=patience,
+                   min_delta=min_delta,
                    validation_metric=validation_metric,
                    validation_iterator=validation_iterator,
                    shuffle=shuffle,
@@ -743,90 +828,7 @@ class Trainer(TrainerBase):
                    should_log_parameter_statistics=should_log_parameter_statistics,
                    should_log_learning_rate=should_log_learning_rate,
                    log_batch_size_period=log_batch_size_period,
-                   moving_average=moving_average)
-
-
-class TrainerPieces(NamedTuple):
-    """
-    We would like to avoid having complex instantiation logic taking place
-    in `Trainer.from_params`. This helper class has a `from_params` that
-    instantiates a model, loads train (and possibly validation and test) datasets,
-    constructs a Vocabulary, creates data iterators, and handles a little bit
-    of bookkeeping. If you're creating your own alternative training regime
-    you might be able to use this.
-    """
-    model: Model
-    iterator: DataIterator
-    train_dataset: Iterable[Instance]
-    validation_dataset: Iterable[Instance]
-    test_dataset: Iterable[Instance]
-    validation_iterator: DataIterator
-    params: Params
-
-    @staticmethod
-    def from_params(params: Params,
-                    serialization_dir: str,
-                    recover: bool = False,
-                    cache_directory: str = None,
-                    cache_prefix: str = None) -> 'TrainerPieces':
-        all_datasets = training_util.datasets_from_params(params, cache_directory, cache_prefix)
-        datasets_for_vocab_creation = set(params.pop("datasets_for_vocab_creation", all_datasets))
-
-        for dataset in datasets_for_vocab_creation:
-            if dataset not in all_datasets:
-                raise ConfigurationError(f"invalid 'dataset_for_vocab_creation' {dataset}")
-
-        logger.info("From dataset instances, %s will be considered for vocabulary creation.",
-                    ", ".join(datasets_for_vocab_creation))
-
-        if recover and os.path.exists(os.path.join(serialization_dir, "vocabulary")):
-            vocab = Vocabulary.from_files(os.path.join(serialization_dir, "vocabulary"))
-            params.pop("vocabulary", {})
-        else:
-            vocab = Vocabulary.from_params(
-                    params.pop("vocabulary", {}),
-                    (instance for key, dataset in all_datasets.items()
-                     for instance in dataset
-                     if key in datasets_for_vocab_creation)
-            )
-
-        model = Model.from_params(vocab=vocab, params=params.pop('model'))
-
-        # If vocab extension is ON for training, embedding extension should also be
-        # done. If vocab and embeddings are already in sync, it would be a no-op.
-        model.extend_embedder_vocab()
-
-        # Initializing the model can have side effect of expanding the vocabulary
-        vocab.save_to_files(os.path.join(serialization_dir, "vocabulary"))
-
-        iterator = DataIterator.from_params(params.pop("iterator"))
-        iterator.index_with(model.vocab)
-        validation_iterator_params = params.pop("validation_iterator", None)
-        if validation_iterator_params:
-            validation_iterator = DataIterator.from_params(validation_iterator_params)
-            validation_iterator.index_with(model.vocab)
-        else:
-            validation_iterator = None
-
-        train_data = all_datasets['train']
-        validation_data = all_datasets.get('validation')
-        test_data = all_datasets.get('test')
-
-        trainer_params = params.pop("trainer")
-        no_grad_regexes = trainer_params.pop("no_grad", ())
-        for name, parameter in model.named_parameters():
-            if any(re.search(regex, name) for regex in no_grad_regexes):
-                parameter.requires_grad_(False)
-
-        frozen_parameter_names, tunable_parameter_names = \
-                    get_frozen_and_tunable_parameter_names(model)
-        logger.info("Following parameters are Frozen  (without gradient):")
-        for name in frozen_parameter_names:
-            logger.info(name)
-        logger.info("Following parameters are Tunable (with gradient):")
-        for name in tunable_parameter_names:
-            logger.info(name)
-
-        return TrainerPieces(model, iterator,
-                             train_data, validation_data, test_data,
-                             validation_iterator, trainer_params)
+                   moving_average=moving_average,
+                   fp16=fp16,
+                   gradient_accumulation_batch_size=gradient_accumulation_batch_size,
+                   num_steps_reset_metrics=num_steps_reset_metrics)

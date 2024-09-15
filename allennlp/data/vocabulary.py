@@ -15,14 +15,31 @@ from allennlp.common.util import namespace_match
 from allennlp.common import Params, Registrable
 from allennlp.common.checks import ConfigurationError
 from allennlp.common.tqdm import Tqdm
+from allennlp.common.file_utils import cached_path
 from allennlp.data import instance as adi  # pylint: disable=unused-import
+from transformers import PreTrainedTokenizer, AutoTokenizer
 
 
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
+USE_HF_SPECIAL_TOKENS = os.environ.get("USE_HF_SPECIAL_TOKENS", False)
+
+# For Huggingface models you need to used HF tokens.
+if USE_HF_SPECIAL_TOKENS:
+    logger.info("=============Using Hugginface tokens [PAD] and [UNK]=============")
+    DEFAULT_PADDING_TOKEN = "[PAD]"
+    DEFAULT_OOV_TOKEN = "[UNK]"
+
+# Use Allen Nlp tokens by default.
+else:
+    # this is default setting
+    logger.info("=============Using AllenNlp tokens '@@PADDING@@' and '@@UNKNOWN@@'=============")
+    DEFAULT_PADDING_TOKEN = "@@PADDING@@"
+    DEFAULT_OOV_TOKEN = "@@UNKNOWN@@"
+
+
 DEFAULT_NON_PADDED_NAMESPACES = ("*tags", "*labels")
-DEFAULT_PADDING_TOKEN = "@@PADDING@@"
-DEFAULT_OOV_TOKEN = "@@UNKNOWN@@"
+
 NAMESPACE_PADDING_FILE = 'non_padded_namespaces.txt'
 
 
@@ -122,11 +139,11 @@ def pop_max_vocab_size(params: Params) -> Union[int, Dict[str, int]]:
     But it could also be a string representing an int (in the case of environment variable
     substitution). So we need some complex logic to handle it.
     """
-    size = params.pop("max_vocab_size", None)
+    size = params.pop("max_vocab_size", None, keep_as_dict=True)
 
-    if isinstance(size, Params):
+    if isinstance(size, dict):
         # This is the Dict[str, int] case.
-        return size.as_dict()
+        return size
     elif size is not None:
         # This is the int / str case.
         return int(size)
@@ -303,13 +320,42 @@ class Vocabulary(Registrable):
         directory : ``str``
             The directory containing the serialized vocabulary.
         """
+        import os
+        import tempfile
+        import tarfile
+        import shutil
+        import atexit
+
+        def _cleanup(path: str):
+            if os.path.exists(path):
+                logger.info("removing temporary unarchived model dir at %s", path)
+                shutil.rmtree(path)
+
         logger.info("Loading token dictionary from %s.", directory)
+
+        # download and decompress if needed
+        directory = cached_path(directory)
+
+        if os.path.isdir(directory):
+            pass
+        else:
+            # Extract to temp dir
+            tempdir = tempfile.mkdtemp()
+            logger.info(f"extracting file {directory} to temp dir {tempdir}")
+            with tarfile.open(directory, 'r:gz') as archive:
+                archive.extractall(tempdir)
+            # Postpone cleanup until exit in case the unarchived contents are needed outside
+            # this function.
+            atexit.register(_cleanup, tempdir)
+            directory = tempdir
+
         with codecs.open(os.path.join(directory, NAMESPACE_PADDING_FILE), 'r', 'utf-8') as namespace_file:
             non_padded_namespaces = [namespace_str.strip() for namespace_str in namespace_file]
 
         vocab = cls(non_padded_namespaces=non_padded_namespaces)
 
         # Check every file in the directory.
+
         for namespace_filename in os.listdir(directory):
             if namespace_filename == NAMESPACE_PADDING_FILE:
                 continue
@@ -321,6 +367,7 @@ class Vocabulary(Registrable):
             else:
                 is_padded = True
             filename = os.path.join(directory, namespace_filename)
+            logger.info("Setting vocab from file {}".format(filename))
             vocab.set_from_file(filename, is_padded, namespace=namespace)
 
         return vocab
@@ -356,6 +403,9 @@ class Vocabulary(Registrable):
         namespace : ``str``, optional (default="tokens")
             What namespace should we overwrite with this vocab file?
         """
+
+        print("filename", filename)
+
         if is_padded:
             self._token_to_index[namespace] = {self._padding_token: 0}
             self._index_to_token[namespace] = {0: self._padding_token}
@@ -375,8 +425,50 @@ class Vocabulary(Registrable):
                 self._token_to_index[namespace][token] = index
                 self._index_to_token[namespace][index] = token
         if is_padded:
+            print(self._oov_token)
+            print(namespace)
             assert self._oov_token in self._token_to_index[namespace], "OOV token not found!"
 
+    
+    @classmethod
+    def from_pretrained_transformer(
+        cls, model_name: str, namespace: str = "tokens", oov_token=DEFAULT_OOV_TOKEN
+    ) -> "Vocabulary":
+        """
+        Initialize a vocabulary from the vocabulary of a pretrained transformer model.
+        If `oov_token` is not given, we will try to infer it from the transformer tokenizer.
+        """
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        if oov_token is None:
+            if hasattr(tokenizer, "_unk_token"):
+                oov_token = tokenizer._unk_token
+            elif hasattr(tokenizer, "special_tokens_map"):
+                oov_token = tokenizer.special_tokens_map.get("unk_token")
+
+        print("Using oov_token={}".format(oov_token))
+        vocab = cls(non_padded_namespaces=[namespace])
+        vocab.add_transformer_vocab(tokenizer, namespace)
+        return vocab  
+    
+    def add_transformer_vocab(
+        self, tokenizer: PreTrainedTokenizer, namespace: str = "tokens"
+    ) -> None:
+        """
+        Copies tokens from a transformer tokenizer's vocab into the given namespace.
+        """
+        try:
+            vocab_items = tokenizer.get_vocab().items()
+        except NotImplementedError:
+            vocab_items = (
+                (tokenizer.convert_ids_to_tokens(idx), idx) for idx in range(tokenizer.vocab_size)
+            )
+
+        for word, idx in vocab_items:
+            self._token_to_index[namespace][word] = idx
+            self._index_to_token[namespace][idx] = word
+
+        self._non_padded_namespaces.add(namespace)
+      
     @classmethod
     def from_instances(cls,
                        instances: Iterable['adi.Instance'],
@@ -442,6 +534,10 @@ class Vocabulary(Registrable):
         # such, we just add the logic for instantiating a registered subclass here,
         # so that most users can continue doing what they were doing.
         vocab_type = params.pop("type", None)
+        if vocab_type == "from_pretrained_transformer":
+            model_name = params.pop("model_name")
+            print("Initializing vocab from pretrained transformer {}".format(model_name))
+            return cls.from_pretrained_transformer(model_name)
         if vocab_type is not None:
             return cls.by_name(vocab_type).from_params(params=params, instances=instances)
 
@@ -462,17 +558,19 @@ class Vocabulary(Registrable):
                 logger.info("Loading Vocab from files instead of dataset.")
 
         if vocabulary_directory:
+            logger.info("Loading vocabulary from directory {}".format(vocabulary_directory))
             vocab = cls.from_files(vocabulary_directory)
+            logger.info("Loading completed. Read vocab from {}".format(vocabulary_directory))
             if not extend:
                 params.assert_empty("Vocabulary - from files")
                 return vocab
         if extend:
             vocab.extend_from_instances(params, instances=instances)
             return vocab
-        min_count = params.pop("min_count", None)
+        min_count = params.pop("min_count", None, keep_as_dict=True)
         max_vocab_size = pop_max_vocab_size(params)
         non_padded_namespaces = params.pop("non_padded_namespaces", DEFAULT_NON_PADDED_NAMESPACES)
-        pretrained_files = params.pop("pretrained_files", {})
+        pretrained_files = params.pop("pretrained_files", {}, keep_as_dict=True)
         min_pretrained_embeddings = params.pop("min_pretrained_embeddings", None)
         only_include_pretrained_words = params.pop_bool("only_include_pretrained_words", False)
         tokens_to_add = params.pop("tokens_to_add", None)
@@ -616,6 +714,13 @@ class Vocabulary(Registrable):
         else:
             return self._token_to_index[namespace][token]
 
+    def add_tokens_to_namespace(self, tokens: List[str], namespace: str = 'tokens') -> List[int]:
+        """
+        Adds ``tokens`` to the index, if they are not already present.  Either way, we return the
+        indices of the tokens in the order that they were given.
+        """
+        return [self.add_token_to_namespace(token, namespace) for token in tokens]
+
     def get_index_to_token_vocabulary(self, namespace: str = 'tokens') -> Dict[int, str]:
         return self._index_to_token[namespace]
 
@@ -687,6 +792,6 @@ class Vocabulary(Registrable):
             logger.info("Vocabulary statistics cannot be printed since " \
                         "dataset instances were not used for its construction.")
 
-
 # the tricky part is that `Vocabulary` is both the base class and the default implementation
 Vocabulary.register("default")(Vocabulary)
+Vocabulary.register("from_pretrained_transformer")(Vocabulary)

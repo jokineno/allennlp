@@ -18,7 +18,9 @@ from allennlp.common.file_utils import cached_path
 from allennlp.common.params import Params, unflatten, with_fallback, parse_overrides
 from allennlp.models.model import Model, _DEFAULT_WEIGHTS
 
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
+
 
 class Archive(NamedTuple):
     """ An archive comprises a Model and its experimental config"""

@@ -1,4 +1,4 @@
-from typing import Dict, Union
+from typing import Dict, Union, Optional
 
 from overrides import overrides
 import torch
@@ -8,6 +8,7 @@ from allennlp.data.vocabulary import Vocabulary
 from allennlp.models.model import Model
 from allennlp.modules.token_embedders.bert_token_embedder import PretrainedBertModel
 from allennlp.nn.initializers import InitializerApplicator
+from allennlp.nn import RegularizerApplicator
 from allennlp.training.metrics import CategoricalAccuracy
 
 
@@ -42,6 +43,8 @@ class BertForClassification(Model):
         Otherwise, they will be frozen and only the final linear layer will be trained.
     initializer : ``InitializerApplicator``, optional
         If provided, will be used to initialize the final linear layer *only*.
+    regularizer : ``RegularizerApplicator``, optional (default=``None``)
+        If provided, will be used to calculate the regularization penalty during training.
     """
     def __init__(self,
                  vocab: Vocabulary,
@@ -51,22 +54,26 @@ class BertForClassification(Model):
                  index: str = "bert",
                  label_namespace: str = "labels",
                  trainable: bool = True,
-                 initializer: InitializerApplicator = InitializerApplicator()) -> None:
-        super().__init__(vocab)
+                 initializer: InitializerApplicator = InitializerApplicator(),
+                 regularizer: Optional[RegularizerApplicator] = None,) -> None:
+        super().__init__(vocab, regularizer)
 
         if isinstance(bert_model, str):
             self.bert_model = PretrainedBertModel.load(bert_model)
         else:
             self.bert_model = bert_model
 
-        self.bert_model.requires_grad = trainable
+        for param in self.bert_model.parameters():
+            param.requires_grad = trainable
 
         in_features = self.bert_model.config.hidden_size
+
+        self._label_namespace = label_namespace
 
         if num_labels:
             out_features = num_labels
         else:
-            out_features = vocab.get_vocab_size(label_namespace)
+            out_features = vocab.get_vocab_size(namespace=self._label_namespace)
 
         self._dropout = torch.nn.Dropout(p=dropout)
 
@@ -139,7 +146,8 @@ class BertForClassification(Model):
         classes = []
         for prediction in predictions_list:
             label_idx = prediction.argmax(dim=-1).item()
-            label_str = self.vocab.get_token_from_index(label_idx, namespace="labels")
+            label_str = (self.vocab.get_index_to_token_vocabulary(self._label_namespace)
+                         .get(label_idx, str(label_idx)))
             classes.append(label_str)
         output_dict["label"] = classes
         return output_dict

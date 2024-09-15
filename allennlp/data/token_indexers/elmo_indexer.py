@@ -1,6 +1,7 @@
 from typing import Dict, List
 
 from overrides import overrides
+import torch
 
 from allennlp.common.checks import ConfigurationError
 from allennlp.common.util import pad_sequence_to_length
@@ -84,6 +85,11 @@ class ELMoCharacterMapper:
         # +1 one for masking
         return [c + 1 for c in char_ids]
 
+    def __eq__(self, other) -> bool:
+        if isinstance(self, other.__class__):
+            return self.__dict__ == other.__dict__
+        return NotImplemented
+
 
 @TokenIndexer.register("elmo_characters")
 class ELMoTokenCharactersIndexer(TokenIndexer[List[int]]):
@@ -135,20 +141,16 @@ class ELMoTokenCharactersIndexer(TokenIndexer[List[int]]):
         # pylint: disable=unused-argument
         return {}
 
-    @overrides
-    def get_padding_token(self) -> List[int]:
-        return []
-
     @staticmethod
     def _default_value_for_padding():
         return [0] * ELMoCharacterMapper.max_word_length
 
     @overrides
-    def pad_token_sequence(self,
-                           tokens: Dict[str, List[List[int]]],
-                           desired_num_tokens: Dict[str, int],
-                           padding_lengths: Dict[str, int]) -> Dict[str, List[List[int]]]:
+    def as_padded_tensor(self,
+                         tokens: Dict[str, List[List[int]]],
+                         desired_num_tokens: Dict[str, int],
+                         padding_lengths: Dict[str, int]) -> Dict[str, torch.Tensor]:
         # pylint: disable=unused-argument
-        return {key: pad_sequence_to_length(val, desired_num_tokens[key],
-                                            default_value=self._default_value_for_padding)
+        return {key: torch.LongTensor(pad_sequence_to_length(
+                val, desired_num_tokens[key], default_value=self._default_value_for_padding))
                 for key, val in tokens.items()}
